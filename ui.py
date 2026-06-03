@@ -1,4 +1,3 @@
-"""Smart EV Delivery System Using A* with Battery Constraint"""
 #─ ui.py — All pygame drawing / UI code, zero routing logic──────────────
 import pygame
 from config import *
