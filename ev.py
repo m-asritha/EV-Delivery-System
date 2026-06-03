@@ -1,3 +1,4 @@
+"""Smart EV Delivery System Using A* with Battery Constraint"""
 # ─── ev.py ────────────────────────────────────────────────────────────────────
 from config import *
 from world  import (nearest_road, nearest_wh_path, nearby_road_nodes, astar, road_adj,
