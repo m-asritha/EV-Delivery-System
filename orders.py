@@ -1,6 +1,7 @@
-# ─── orders.py — Order creation, queue management, priority ──────────────────
+# orders.py — Order creation, queue management, priority, weight, warehouse ─
 import random
 from config import *
+from world import wh_roads, astar, nearest_road
 
 order_queue      = []
 order_id_counter = [0]
@@ -10,7 +11,21 @@ AGING_INTERVAL_FRAMES = 150   # 5 seconds at 30 fps
 STANDARD_BOOST_RATE   = 0.30
 EXPRESS_BOOST_RATE    = 0.10
 
-# ── Factory ────────────────────────────────────────────────────────────────────
+# ─── Multi-warehouse assignment (Upgrade 7) ──────────────────────────────────
+def nearest_warehouse_to(house):
+    """Return the index of the warehouse with the shortest road-path to
+    `house`. Used so each order is dispatched from its nearest warehouse."""
+    rn = nearest_road(house)
+    if rn is None or not wh_roads:
+        return 0
+    best_i, best_len = 0, 9999
+    for i, wr in enumerate(wh_roads):
+        p = astar(wr, rn)
+        if p and len(p) < best_len:
+            best_i, best_len = i, len(p)
+    return best_i
+
+# ─── Factory ──────────────────────────────────────────────────────────────────
 def make_order(house, mode=None, scheduled_frame=None, priority_boost=False):
     if mode is None:
         mode = random.choice(Mode_WEIGHTS)
@@ -28,10 +43,12 @@ def make_order(house, mode=None, scheduled_frame=None, priority_boost=False):
         "id":              order_id_counter[0],
         "scheduled_frame": sched,
         "placed_frame":    sim_time[0] * 30,   # used for aging
-        "priority_boost":  priority_boost,      # True → was stranded, re-queued
+        "priority_boost":  priority_boost,      # True -> was stranded, re-queued
+        "weight":          random.randint(Order_Min_Weight, Order_Max_Weight),
+        "warehouse":       nearest_warehouse_to(house),  # Upgrade 7
     }
 
-# ── Priority key (with aging) ──────────────────────────────────────────────────
+# ─── Priority key (with aging) ─────────────────────────────────────────────────
 def order_sort_key(o):
     current_frame = sim_time[0] * 30
     placed        = o.get("placed_frame", current_frame)
@@ -49,7 +66,7 @@ def order_sort_key(o):
     aged = max(0.0, 2.0 - intervals * STANDARD_BOOST_RATE)
     return (aged, 0, o["id"])
 
-# ── Queue operations ───────────────────────────────────────────────────────────
+# ─── Queue operations ──────────────────────────────────────────────────────────
 def enqueue_order(order):
     order_queue.append(order)
     order_queue.sort(key=order_sort_key)
@@ -72,8 +89,11 @@ def get_ready_orders():
         and sim_time[0] * 30 < o["scheduled_frame"]
     )]
 
-# ── Spatial batching helper ────────────────────────────────────────────────────
-def get_spatial_batch(anchor_order, max_size):
+# ─── Spatial + weight-aware batching (Upgrade 8) ───────────────────────────────
+def get_spatial_batch(anchor_order, max_size, capacity=None):
+    """Group nearby ready orders with the anchor, but stop adding orders
+    once the cumulative weight would exceed `capacity` (if given).
+    Falls back to count-based limiting (max_size) when capacity is None."""
     ready = get_ready_orders()
     if not ready:
         return []
@@ -85,9 +105,24 @@ def get_spatial_batch(anchor_order, max_size):
         key=lambda o: abs(o["house"][0] - ah) + abs(o["house"][1] - aw)
     )
 
-    return [anchor_order] + scored[: max_size - 1]
+    batch = [anchor_order]
+    total_w = anchor_order.get("weight", 1)
 
-# ── Query helpers ──────────────────────────────────────────────────────────────
+    for o in scored:
+        if len(batch) >= max_size:
+            break
+        w = o.get("weight", 1)
+        if capacity is not None and total_w + w > capacity:
+            continue
+        batch.append(o)
+        total_w += w
+
+    return batch
+
+def batch_weight(batch):
+    return sum(o.get("weight", 1) for o in batch)
+
+# ─── Query helpers ──────────────────────────────────────────────────────────────
 def house_in_queue(h):
     return any(o["house"] == h for o in order_queue)
 

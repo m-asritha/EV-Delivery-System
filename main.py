@@ -1,38 +1,46 @@
-"""Smart EV Delivery System Using A* with Battery Constraint"""
+"""Multi-Agent Cooperative EV Logistics Simulator (no ML/DL)"""
 # ─── main.py — Game loop only ─────────────────────────────────────────────────
 import pygame, random, sys
 
 from config import *
-from world  import grid, houses, wh_roads
+from world  import (grid, houses, wh_roads, update_traffic, update_road_blocks)
+import world
 from orders import (order_queue, sim_time, make_order, enqueue_order,
                         resort_queue, get_ready_orders, house_in_queue,
-                        house_assigned, get_spatial_batch,order_sort_key)
-from ev import EV, pick_best_ev_for_order, nearest_road, astar,nearest_wh_path
+                        house_assigned, get_spatial_batch, order_sort_key)
+from ev import EV, pick_best_ev_for_order, nearest_road, astar, nearest_wh_path, register_evs
 from ui import (init_fonts, startup_screen, draw_roads, draw_map_tiles,
                     draw_paths, draw_order_pins, draw_evs,
                     draw_dlg, draw_hover_tooltip, draw_sched_input_dialog,
-                    draw_bottom_panel, draw_sim_clock, cell_center)
+                    draw_bottom_panel, draw_sim_clock, draw_heatmap,
+                    draw_end_report, cell_center)
+import fleet, chargers as charger_mgr, weather
+from kpi import kpi
+from world import path_cost
 
 pygame.init()
 screen = pygame.display.set_mode((Width, Height))
-pygame.display.set_caption("Smart EV Delivery System")
+pygame.display.set_caption("Multi-Agent Cooperative EV Logistics Simulator")
 clock = pygame.time.Clock()
 init_fonts()
 
 def _assign_nearest_evs(evs):
+    """Assign ready orders to free EVs, biased toward each order's
+    nearest warehouse (Upgrade 7) and respecting EV payload capacity
+    (Upgrade 8) via get_spatial_batch's capacity argument."""
     ready = get_ready_orders()
     if not ready:
         return
     free_evs = [ev for ev in evs
                 if ev.phase in ("idle", "returning")
                 and not ev._going_to_charge
-                and ev.battery > Low_Battery]
+                and ev.battery > Low_Battery
+                and ev.free_capacity() > 0]
     if not free_evs:
         return
     assigned_ev_ids = set()
     claimed_orders  = set()
 
-    # Score every (order, ev) pair by path distance
     pairs = []
     for order in ready:
         rn = nearest_road(order["house"])
@@ -40,7 +48,10 @@ def _assign_nearest_evs(evs):
             continue
         for ev in free_evs:
             p    = astar(ev.pos, rn)
-            dist = len(p) if p else 9999
+            dist = path_cost(p) if p else 9999
+            # Slight bonus for EVs near the order's assigned warehouse
+            if ev.home_wh == order.get("warehouse"):
+                dist = max(0, dist - 2)
             pairs.append((dist, order["id"], order, ev))
 
     pairs.sort(key=lambda x: x[0])
@@ -50,6 +61,8 @@ def _assign_nearest_evs(evs):
             continue
         if id(ev) in assigned_ev_ids:
             continue
+        if order.get("weight", 1) > ev.free_capacity():
+            continue
         _load_ev_with_anchor(ev, order)
         assigned_ev_ids.add(id(ev))
         for o in ev.loaded:
@@ -58,22 +71,26 @@ def _assign_nearest_evs(evs):
     remaining = [o for o in order_queue if o["id"] not in claimed_orders]
     for order in remaining:
         ev = pick_best_ev_for_order(evs, order)
-        if ev and id(ev) not in assigned_ev_ids:
+        if ev and id(ev) not in assigned_ev_ids and order.get("weight",1) <= ev.free_capacity():
             _load_ev_with_anchor(ev, order)
             assigned_ev_ids.add(id(ev))
             for o in ev.loaded:
                 claimed_orders.add(o["id"])
-                
+
 def _load_ev_with_anchor(ev, anchor_order):
-    """Load an EV starting from a specific anchor order, then batch nearby ones."""
+    """Load an EV starting from a specific anchor order, then batch nearby
+    ones, respecting remaining payload capacity (Upgrade 8)."""
     if anchor_order not in order_queue:
         return
-    batch = get_spatial_batch(anchor_order, Batch_Size)
+    capacity = ev.free_capacity()
+    batch = get_spatial_batch(anchor_order, Batch_Size, capacity=capacity)
+    if not batch:
+        return
     for o in batch:
         if o in order_queue:
             order_queue.remove(o)
+            kpi.record_departure_wait(o, sim_time[0]*30)
     batch.sort(key=order_sort_key)
-    # Preserve orders the EV is already carrying — never discard them
     existing = [o for o in ev.loaded if o not in batch]
     ev.loaded = existing + batch
     ev.loaded.sort(key=order_sort_key)
@@ -90,9 +107,17 @@ def _load_ev_with_anchor(ev, anchor_order):
                 ev.path      = p[1:]
                 ev.full_path = list(p)
 
+
 def run_sim(auto_mode):
     evs = [EV(i) for i in range(Num_EVs)]
+    register_evs(evs)
     order_queue.clear()
+    fleet.reset()
+    kpi.reset()
+    charger_mgr.reservations.clear()
+    charger_mgr.wait_queues.clear()
+    world.blocked_roads.clear()
+    world.road_block_events.clear()
 
     paused = False
     timer               = 0
@@ -103,6 +128,8 @@ def run_sim(auto_mode):
     sched_input_text    = ""
     sched_input_error   = ""
     sched_pending_house = None
+    show_heatmap        = False
+    show_report         = False
     path_surf           = pygame.Surface((Width, Map), pygame.SRCALPHA)
     click_flash         = []
     back_r              = pygame.Rect(0, 0, 1, 1)
@@ -113,13 +140,19 @@ def run_sim(auto_mode):
             frame      += 1
             sim_time[0] = frame // 30
             resort_queue()
-        
+            # Dynamic systems (Upgrades 4, 5, 10)
+            if frame % TRAFFIC_UPDATE_INTERVAL == 0:
+                update_traffic()
+            update_road_blocks(frame)
+            if weather.update_weather(frame):
+                fleet.log(frame, f"Weather changed to {weather.name()}")
+
         clock.tick(30)
 
         mx, my   = pygame.mouse.get_pos()
         mr, mc_g = my // Cell, mx // Cell
         hover_h  = None
-        if (not auto_mode and not show_sched_input
+        if (not auto_mode and not show_sched_input and not show_report
                 and 0 <= mr < Rows and 0 <= mc_g < Cols and my < Map):
             h = (mr, mc_g)
             if (grid[mr][mc_g] == 4
@@ -131,6 +164,11 @@ def run_sim(auto_mode):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit(); sys.exit()
+
+            if show_report:
+                if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_k):
+                    show_report = False
+                continue
 
             # Scheduled dialog
             if show_sched_input:
@@ -193,6 +231,12 @@ def run_sim(auto_mode):
 
                 if event.key == pygame.K_r:
                     order_queue.clear()
+                    fleet.reset()
+                    kpi.reset()
+                    charger_mgr.reservations.clear()
+                    charger_mgr.wait_queues.clear()
+                    world.blocked_roads.clear()
+                    world.road_block_events.clear()
                     for ev in evs:
                         ev.pos = wh_roads[ev.idx % len(wh_roads)]
                         ev.battery = Max_Battery
@@ -200,10 +244,15 @@ def run_sim(auto_mode):
                         ev.path = []; ev.full_path = []
                         ev.dlg = False; ev.dlg_house = None; ev.dlg_nodes = []
                         ev._going_to_charge = False
+                        ev._reserved_charger = None
                         ev.phase = "idle"; ev.set_status("Idle"); ev.delivered = 0
 
                 if event.key == pygame.K_p:
                     paused = not paused
+                if event.key == pygame.K_h:
+                    show_heatmap = not show_heatmap
+                if event.key == pygame.K_k:
+                    show_report = not show_report
                 if event.key == pygame.K_1:
                     manual_mode = Mode_EXPRESS
                 if event.key == pygame.K_2:
@@ -212,12 +261,10 @@ def run_sim(auto_mode):
                     manual_mode = Mode_SCHEDULED
 
                 # ── TEST-CASE SHORTCUTS ───────────────────────────────────────
-                # T → drain all EVs to low battery
                 if event.key == pygame.K_t:
                     for ev in evs:
                         ev.battery = Low_Battery - 1
 
-                # S → simulate a stranded EV (drain to 0, keep orders)
                 if event.key == pygame.K_s:
                     for ev in evs:
                         if ev.loaded:
@@ -270,9 +317,9 @@ def run_sim(auto_mode):
                             chosen = node
                             break
                     if chosen:
-                        from world import astar
+                        from world import astar as _astar
                         h = ev.dlg_house
-                        p = astar(ev.pos, chosen)
+                        p = _astar(ev.pos, chosen)
                         if p:
                             ev.target = h; ev.target_rn = chosen
                             ev.path = p[1:]; ev.full_path = list(p)
@@ -323,13 +370,17 @@ def run_sim(auto_mode):
                     _assign_nearest_evs(evs)
 
             # ── EV ticks ──────────────────────────────────────────────────────────
-            for ev in evs:
+            # Movement priority order (Upgrade 6): EXPRESS-carrying EVs tick
+            # first so they claim contested nodes before others.
+            for ev in sorted(evs, key=lambda e: 0 if (e.loaded and e.loaded[0]["mode"]==Mode_EXPRESS) else 1):
                 ev.tick(frame)
 
         # ── Draw ──────────────────────────────────────────────────────────────
         screen.fill(C_Bg)
         draw_roads(screen, grid)
         draw_map_tiles(screen, grid, hover_h, frame, evs)
+        if show_heatmap:
+            draw_heatmap(screen, frame)
         draw_paths(screen, evs, path_surf)
         draw_order_pins(screen, evs, frame)
         draw_evs(screen, evs, frame)
@@ -342,6 +393,9 @@ def run_sim(auto_mode):
 
         pill_rects, back_r = draw_bottom_panel(screen, evs, auto_mode, manual_mode, frame, paused)
         draw_sim_clock(screen, sim_time[0])
+
+        if show_report:
+            draw_end_report(screen, evs)
 
         pygame.display.flip()
     return "menu"

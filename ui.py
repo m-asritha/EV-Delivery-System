@@ -1,8 +1,10 @@
 #─ ui.py — All pygame drawing / UI code, zero routing logic──────────────
 import pygame
 from config import *
-from world  import labels
+from world  import labels, traffic_grid, blocked_roads, warehouses, chargers
 from orders import sim_time, order_queue
+import fleet, chargers as charger_mgr, weather
+from kpi import kpi
 
 fonts = {}
 
@@ -52,19 +54,28 @@ def _is_sched_waiting(o):
     return (o["mode"]==Mode_SCHEDULED and o["scheduled_frame"]
             and sim_time[0]*30 < o["scheduled_frame"])
 
-# Map drawing 
+# ── Map drawing ───────────────────────────────────────────────────────────────
 def draw_roads(screen, grid):
-    for axis, rng_outer, rng_inner, rect_fn in [
-        (0, Rows, Cols, lambda s,e,c: (s*Cell,c*Cell,(e-s)*Cell,Cell)),
-        (1, Cols, Rows, lambda s,e,c: (c*Cell,s*Cell,Cell,(e-s)*Cell)),
-    ]:
-        for i in range(rng_outer):
-            s = None
-            for j in range(rng_inner+1):
-                rd = j<rng_inner and (grid[i][j] if axis==0 else grid[j][i])==1
-                if rd and s is None: s=j
-                elif not rd and s is not None:
-                    pygame.draw.rect(screen, C_Road, rect_fn(s,j,i)); s=None
+    """Draw roads tinted by traffic congestion level (Upgrade 4) and mark
+    dynamically blocked road cells with a red X overlay (Upgrade 5)."""
+    for r in range(Rows):
+        for c in range(Cols):
+            if grid[r][c] != 1:
+                continue
+            level = traffic_grid[r][c]
+            base = TRAFFIC_COLORS.get(level, C_Road)
+            # Blend traffic color with base road color so it stays subtle
+            col = tuple((b*2 + t) // 3 for b, t in zip(C_Road, base))
+            pygame.draw.rect(screen, col, (c*Cell, r*Cell, Cell, Cell))
+
+    # Blocked road overlay
+    for (r, c) in blocked_roads:
+        x, y = c*Cell, r*Cell
+        s = pygame.Surface((Cell, Cell), pygame.SRCALPHA)
+        s.fill((200, 30, 30, 110))
+        pygame.draw.line(s, (255,255,255,200), (3,3), (Cell-3,Cell-3), 2)
+        pygame.draw.line(s, (255,255,255,200), (Cell-3,3), (3,Cell-3), 2)
+        screen.blit(s, (x, y))
 
 def draw_building(screen, r, c, fill, border, tcol, lbl, key="xs"):
     x,y = c*Cell+2, r*Cell+2; w,h = Cell-4, Cell-4
@@ -91,30 +102,42 @@ def draw_node_option(screen, node, idx, hovered, mx, my):
     pygame.draw.circle(screen, (255,255,255), (cx,cy), 10, 2)
     _blit_centered(screen, fonts["xs"].render(str(idx+1), True, (0,0,0)), cx, cy)
 
-# Map tiles
+# ── Map tiles ───────────────────────────────────────────────────────────────
 def draw_map_tiles(screen, grid, hover_h, frame, evs=None):
-
     for r in range(Rows):
         for c in range(Cols):
             v = grid[r][c]
-            if   v==2:
-                draw_building(screen, r, c, C_Wh_F, C_Wh_B, C_Wh_B, "WH", "md")
+            if v==2:
+                wh_idx = warehouses.index((r,c)) if (r,c) in warehouses else 0
+                draw_building(screen, r, c, C_Wh_F, C_Wh_B, C_Wh_B, f"WH{wh_idx+1}", "h")
 
-                # 🔥 Draw EV dots if EV is docked near this warehouse
                 if evs:
                     cx, cy = cell_center(r, c)
-
-                    # find nearby EVs (distance = 1 tile → adjacent road)
                     docked = [ev for ev in evs
                             if ev.phase in ("idle", "loading")
                             and abs(ev.pos[0] - r) + abs(ev.pos[1] - c) == 1]
-
                     for i, ev in enumerate(docked):
                         dx = cx - 6 + i * 6
                         dy = cy + 6
                         pygame.draw.circle(screen, ev.color, (dx, dy), 3)
                         pygame.draw.circle(screen, (0, 0, 0), (dx, dy), 3, 1)
-            elif v==3: draw_building(screen,r,c,C_Ch_F,C_Ch_B,C_Ch_B,"C","sm")
+            elif v==3:
+                # Charger — show reservation status (Upgrade 3)
+                ch_pos = (r,c)
+                reserved = charger_mgr.reservations.get(ch_pos, [])
+                queued   = charger_mgr.wait_queues.get(ch_pos, [])
+                if reserved:
+                    fc, bc = (60,30,10), C_Orange
+                elif queued:
+                    fc, bc = (50,40,10), C_Yellow
+                else:
+                    fc, bc = C_Ch_F, C_Ch_B
+                draw_building(screen,r,c,fc,bc,bc,"C","sm")
+                if reserved or queued:
+                    cx,cy = cell_center(r,c)
+                    lbl = f"{len(reserved)}/{CHARGER_SLOTS}"
+                    if queued: lbl += f"+{len(queued)}q"
+                    _blit_centered(screen, fonts["xs"].render(lbl,True,bc), cx, cy+Cell//2-2)
             elif v==4:
                 ih  = (hover_h==(r,c))
                 op  = next((o["mode"] for o in order_queue if o["house"]==(r,c)), None)
@@ -123,7 +146,24 @@ def draw_map_tiles(screen, grid, hover_h, frame, evs=None):
                 if op is not None:
                     txt(screen,_mode_letter(op),c*Cell+2,r*Cell+2,"xs",Mode_COLORS[op])
 
-# EV paths
+# ── Delivery heatmap (Upgrade 13) ────────────────────────────────────────────
+def draw_heatmap(screen, frame):
+    """Overlay translucent circles on houses sized/colored by delivery
+    frequency. Toggled with [H] key."""
+    if not kpi.heatmap:
+        return
+    max_count = max(kpi.heatmap.values())
+    for house, count in kpi.heatmap.items():
+        cx, cy = cell_center(house[0], house[1])
+        intensity = count / max_count
+        radius = int(8 + intensity * 16)
+        alpha  = int(60 + intensity * 140)
+        col = (255, int(140 - 100*intensity), 40)
+        s = pygame.Surface((radius*2+4, radius*2+4), pygame.SRCALPHA)
+        pygame.draw.circle(s, (*col, alpha), (radius+2, radius+2), radius)
+        screen.blit(s, (cx-radius-2, cy-radius-2))
+
+# ── EV paths ──────────────────────────────────────────────────────────────────
 def draw_paths(screen, evs, path_surf):
     path_surf.fill((0,0,0,0))
     for ev in evs:
@@ -135,7 +175,7 @@ def draw_paths(screen, evs, path_surf):
             pygame.draw.lines(path_surf,(*ec,155),False,[cell_center(r,c) for r,c in rem],3)
     screen.blit(path_surf,(0,0))
 
-# Order pins
+# ── Order pins ──────────────────────────────────────────────────────────────────
 def draw_order_pins(screen, evs, frame):
     pulse = 0.5+0.5*abs((frame%24)/12-1)
     for o in order_queue:
@@ -150,7 +190,7 @@ def draw_order_pins(screen, evs, frame):
             tm = ev.loaded[0]["mode"] if ev.loaded else Mode_STANDARD
             draw_pin(screen,ev.target[0],ev.target[1],Mode_COLORS[tm],pulse*0.7)
 
-# EV sprites
+# ── EV sprites ──────────────────────────────────────────────────────────────────
 def draw_evs(screen, evs, frame):
     for ev in evs:
         ex,ey = cell_center(ev.pos[0],ev.pos[1])
@@ -167,7 +207,7 @@ def draw_evs(screen, evs, frame):
         pygame.draw.rect(screen,C_Panel_BD,(ex-bw//2,ey+12,bw,4),border_radius=2)
         if fw: pygame.draw.rect(screen,bc,(ex-bw//2,ey+12,fw,4),border_radius=2)
 
-# Blocked-route dialog
+# ── Blocked-route dialog ─────────────────────────────────────────────────────────
 def draw_dlg(screen, evs, mx, my):
     for ev in evs:
         if not ev.dlg or not ev.dlg_nodes: continue
@@ -182,14 +222,14 @@ def draw_dlg(screen, evs, mx, my):
         pygame.draw.rect(screen,C_Red,skip_r,border_radius=4)
         txt(screen,"Skip order",skip_r.x+8,skip_r.y+6,"xs",(255,255,255))
 
-# Hover tooltip 
+# ── Hover tooltip ─────────────────────────────────────────────────────────────
 def draw_hover_tooltip(screen, hover_h, manual_mode, mx, my, show_sched_input):
     if not hover_h or my>=Map or show_sched_input: return
     hint = f"{Mode_ICONS[manual_mode]} {Mode_NAMES[manual_mode]} -> {labels.get(hover_h,'?')}"
     hs = fonts["xs"].render(hint, True, Mode_COLORS[manual_mode])
     screen.blit(hs,(min(mx+12,Width-hs.get_width()-4), max(4,my-16)))
 
-# Scheduled input dialog 
+# ── Scheduled input dialog ───────────────────────────────────────────────────────
 def draw_sched_input_dialog(screen, sched_input_text, sched_input_error):
     dw,dh=420,200; dx,dy=Width//2-dw//2,Map//2-dh//2
     dim=pygame.Surface((Width,Map),pygame.SRCALPHA); dim.fill((0,0,0,150))
@@ -214,10 +254,11 @@ def draw_sched_input_dialog(screen, sched_input_text, sched_input_error):
     txt(screen,"Cancel",canc_r.x+10,canc_r.y+8,"xs",C_Red)
     return conf_r, canc_r
 
-# Bottom panel──────────
+# ── Bottom panel ─────────────────────────────────────────────────────────────────
 PANEL_LEFT_W  = 160
 PANEL_RIGHT_W = 320
 PANEL_EV_W    = (Width - PANEL_LEFT_W - PANEL_RIGHT_W) // Num_EVs
+DASH_H        = 100   # extra fleet-coordination dashboard strip height
 
 PH_COLORS = {"idle":C_Muted,"loading":C_Green,"delivering":C_Green,"returning":C_Blue,"charging":C_Yellow}
 PH_LABELS = {"idle":"IDLE","loading":"LOADING","delivering":"DELIVER","returning":"RETURN","charging":"CHARGE"}
@@ -249,11 +290,19 @@ def draw_bottom_panel(screen, evs, auto_mode, manual_mode, frame, paused=False):
     txt(screen,f"QUEUE: {len(order_queue)}",sx+6,sy+51,"xs",q_col)
     sw=sum(1 for o in order_queue if _is_sched_waiting(o))
     if sw: txt(screen,f"Sched wait: {sw}",sx,sy+72,"xs",Mode_COLORS[Mode_SCHEDULED])
-    txt(screen,"[R]Reset  [1/2/3]Mode",sx,sy+96,"xs",(155,168,200))
+
+    # Weather indicator (Upgrade 10)
+    w_col = WEATHER_COLORS[weather.current_weather[0]]
+    wr = pygame.Rect(sx, sy+94, 138, 20)
+    draw_rounded_rect(screen, w_col, wr, radius=4, alpha=30)
+    draw_rounded_rect(screen, (0,0,0), wr, radius=4, border=1, border_color=w_col)
+    txt(screen, f"{WEATHER_ICONS[weather.current_weather[0]]} {weather.name()}", sx+6, sy+98, "xs", w_col)
+
+    txt(screen,"[R]Reset [P]Pause [H]Heat [K]Report",sx,sy+118,"xs",(155,168,200))
     pygame.draw.line(screen,C_Divider,(PANEL_LEFT_W,PY+5),(PANEL_LEFT_W,PY+Panel_h-5),1)
 
     for i,ev in enumerate(evs):
-        bx=PANEL_LEFT_W+i*PANEL_EV_W+4; by=PY+4; cw=PANEL_EV_W-8; ch=Panel_h-8
+        bx=PANEL_LEFT_W+i*PANEL_EV_W+4; by=PY+4; cw=PANEL_EV_W-8; ch=Panel_h-8-DASH_H
         draw_rounded_rect(screen,C_Panel2,(bx,by,cw,ch),radius=5)
         draw_rounded_rect(screen,(0,0,0),(bx,by,cw,ch),radius=5,border=1,border_color=ev.color)
         pygame.draw.circle(screen,ev.color,(bx+11,by+11),6)
@@ -267,11 +316,16 @@ def draw_bottom_panel(screen, evs, auto_mode, manual_mode, frame, paused=False):
         bc_col=batt_col(ev.battery)
         draw_batt(screen,bx+4,by+24,cw-8,6,ev.battery,bc_col)
         txt(screen,f"{ev.battery}%",bx+4,by+32,"xs",bc_col)
-        txt(screen,f"Del:{ev.delivered}",bx+4,by+46,"xs",C_Text)
+        # Capacity bar (Upgrade 8)
+        wgt = ev.current_weight()
+        cap_pct = int(100*wgt/EV_Max_Payload)
+        cap_col = C_Red if cap_pct>=90 else C_Yellow if cap_pct>=60 else C_Blue
+        draw_batt(screen,bx+4,by+40,cw-8,5,cap_pct,cap_col)
+        txt(screen,f"Del:{ev.delivered}  {wgt}/{EV_Max_Payload}kg",bx+4,by+47,"xs",C_Text)
         if ev.loaded:
             px2,py2=bx+4,by+62
             for o in ev.loaded[:6]:
-                col=Mode_COLORS[o["mode"]]; badge_w=18
+                col=Mode_COLORS[o["mode"]]
                 house_label = labels.get(o["house"], "?")
                 badge_w = max(18, len(house_label)*8)
                 rb=pygame.Rect(px2,py2,badge_w,11)
@@ -279,10 +333,10 @@ def draw_bottom_panel(screen, evs, auto_mode, manual_mode, frame, paused=False):
                 _blit_centered(screen, fonts["xs"].render(house_label,True,(0,0,0)),
                                px2+badge_w//2, py2+5)
                 px2+=badge_w+2
-        txt(screen,ev.status[:26],bx+4,by+78,"xs",C_Muted)
+        txt(screen,ev.status[:26],bx+4,by+ch-16,"xs",C_Muted)
         if i<Num_EVs-1:
             pygame.draw.line(screen,C_Divider,(PANEL_LEFT_W+(i+1)*PANEL_EV_W,PY+5),
-                             (PANEL_LEFT_W+(i+1)*PANEL_EV_W,PY+Panel_h-5),1)
+                             (PANEL_LEFT_W+(i+1)*PANEL_EV_W,PY+ch+5),1)
 
     rx=Width-PANEL_RIGHT_W+6; ry=PY+5
     pygame.draw.line(screen,C_Divider,(rx-6,PY+5),(rx-6,PY+Panel_h-5),1)
@@ -316,17 +370,62 @@ def draw_bottom_panel(screen, evs, auto_mode, manual_mode, frame, paused=False):
         is_sw=_is_sched_waiting(o)
         wt=f" ~{max(0,(o['scheduled_frame']-sim_time[0]*30)//30)}s" if is_sw else ""
         pygame.draw.circle(screen,mc,(qx+5,qy2+6),4)
-        txt(screen,f"{Mode_NAMES[o['mode']][:3]} {labels.get(o['house'],'?')}{wt}"[:20],
+        txt(screen,f"{Mode_NAMES[o['mode']][:3]} {labels.get(o['house'],'?')}({o.get('weight','?')}kg){wt}"[:24],
             qx+13,qy2,"xs",(100,115,145) if is_sw else mc)
     if not order_queue:
         txt(screen,"No orders queued",qx,ry+13,"xs",(100,115,145))
 
-    back_r=pygame.Rect(sx,sy+112,138,22)
+    back_r=pygame.Rect(sx,sy+140,138,22)
     hov=back_r.collidepoint(*pygame.mouse.get_pos())
     pygame.draw.rect(screen,(100,30,30) if hov else (50,20,20),back_r,border_radius=4)
     pygame.draw.rect(screen,C_Red,back_r,1,border_radius=4)
     lb=fonts["xs"].render("◀ Main Menu",True,(255,180,180) if hov else C_Red)
     screen.blit(lb,(back_r.x+(138-lb.get_width())//2,back_r.y+5))
+
+    # ── Fleet Coordination Dashboard strip (Upgrade 14) ─────────────────────
+    dash_y = PY + Panel_h - DASH_H
+    pygame.draw.line(screen, C_Panel_BD, (0, dash_y), (Width, dash_y), 1)
+    txt(screen, "FLEET COORDINATION — comms / chargers / transfers / KPIs",
+        6, dash_y+3, "xs", (180,190,215))
+
+    col_w = Width // 4
+    
+    # Column 2: charger reservations
+    txt(screen, "CHARGER RESERVATIONS", col_w+8, dash_y+20, "xs", C_Yellow)
+    line_i = 0
+    for ch in chargers:
+        res = charger_mgr.reservations.get(ch, [])
+        wq  = charger_mgr.wait_queues.get(ch, [])
+        if not res and not wq:
+            continue
+        names = [evs[i].name for i in res if i < len(evs)]
+        qnames = [evs[i].name for i in wq if i < len(evs)]
+        s = f"{ch}: {','.join(names) or '-'}"
+        if qnames:
+            s += f" | wait:{','.join(qnames)}"
+        txt(screen, s[:34], col_w+8, dash_y+34+line_i*12, "xs", C_Muted)
+        line_i += 1
+        if line_i >= 5: break
+    if line_i == 0:
+        txt(screen, "No active reservations", col_w+8, dash_y+34, "xs", (100,115,145))
+
+    # Column 3: order transfers (from messages, filtered)
+    txt(screen, "ORDER TRANSFERS", col_w*2+8, dash_y+20, "xs", C_Orange)
+    transfer_msgs = [(f,m) for f,m in fleet.messages if "transferred" in m]
+    for i,(f,m) in enumerate(transfer_msgs[-5:]):
+        txt(screen, f"[{f//30:>4}s] {m}"[:34], col_w*2+8, dash_y+34+i*12, "xs", C_Muted)
+    if not transfer_msgs:
+        txt(screen, "No transfers yet", col_w*2+8, dash_y+34, "xs", (100,115,145))
+
+    # Column 4: live KPIs
+    txt(screen, "LIVE KPIs", col_w*3+8, dash_y, "xs", C_Green)
+    kx = col_w*3+8
+    txt(screen, f"Deliveries: {kpi.total_deliveries}", kx, dash_y+12, "xs", C_Text)
+    txt(screen, f"On-time: {kpi.on_time_pct():.0f}%", kx, dash_y+24, "xs", C_Text)
+    txt(screen, f"Avg deliv: {kpi.avg_delivery_time_sec():.1f}s", kx, dash_y+36, "xs", C_Text)
+    txt(screen, f"Dist: {kpi.distance_travelled} cells", kx, dash_y+48, "xs", C_Text)
+    txt(screen, f"Energy: {kpi.energy_consumed}% | Charges: {kpi.charging_events}", kx, dash_y+60, "xs", C_Text)
+
     return pill_rects, back_r
 
 def draw_sim_clock(screen, elapsed):
@@ -335,7 +434,59 @@ def draw_sim_clock(screen, elapsed):
         True,C_Muted)
     screen.blit(ts,(Width-ts.get_width()-6,4))
 
-# Legend & startup──────
+# ── End-of-Simulation Report (Upgrade 12) ─────────────────────────────────────
+def draw_end_report(screen, evs):
+    """Full-screen overlay summarizing fleet performance. Press ESC to close."""
+    overlay = pygame.Surface((Width, Height), pygame.SRCALPHA)
+    overlay.fill((8, 10, 18, 235))
+    screen.blit(overlay, (0,0))
+
+    txt_center(screen, "📊 SIMULATION PERFORMANCE REPORT", 40, "xl", C_Gold)
+    pygame.draw.line(screen, C_Panel_BD, (Width//2-420, 84), (Width//2+420, 84), 1)
+
+    cols_x = [Width//2-420, Width//2-100, Width//2+220]
+    y0 = 110
+
+    # Column 1: overall KPIs
+    txt(screen, "OVERALL KPIs", cols_x[0], y0, "lg", C_Blue)
+    rows = [
+        f"Total deliveries: {kpi.total_deliveries}",
+        f"On-time deliveries: {kpi.on_time_deliveries}",
+        f"Late deliveries: {kpi.late_deliveries}",
+        f"On-time %: {kpi.on_time_pct():.1f}%",
+        f"Avg delivery time: {kpi.avg_delivery_time_sec():.1f}s",
+        f"Avg waiting time: {kpi.avg_wait_time_sec():.1f}s",
+        f"Distance travelled: {kpi.distance_travelled} cells",
+        f"Energy consumed: {kpi.energy_consumed}%",
+        f"Charging events: {kpi.charging_events}",
+        f"Order transfers: {kpi.transfer_events}",
+    ]
+    for i, r in enumerate(rows):
+        txt(screen, r, cols_x[0], y0+34+i*24, "sm", C_Text)
+
+    # Column 2: per-EV stats
+    txt(screen, "PER-EV STATS", cols_x[1], y0, "lg", C_Green)
+    for i, ev in enumerate(evs):
+        yy = y0+34+i*70
+        pygame.draw.circle(screen, ev.color, (cols_x[1]+8, yy+6), 7)
+        txt(screen, ev.name, cols_x[1]+20, yy-2, "md", ev.color)
+        txt(screen, f"Delivered: {ev.delivered}", cols_x[1]+20, yy+18, "xs", C_Text)
+        txt(screen, f"Battery: {ev.battery}%", cols_x[1]+20, yy+34, "xs", batt_col(ev.battery))
+        txt(screen, f"Phase: {ev.phase}", cols_x[1]+20, yy+50, "xs", C_Muted)
+
+    # Column 3: delivery heatmap top locations
+    txt(screen, "TOP DELIVERY LOCATIONS", cols_x[2], y0, "lg", C_Orange)
+    top = kpi.top_heatmap_locations(8)
+    if not top:
+        txt(screen, "No deliveries recorded", cols_x[2], y0+34, "sm", C_Muted)
+    for i, (house, count) in enumerate(top):
+        txt(screen, f"House {labels.get(house,'?')}: {count} deliveries",
+            cols_x[2], y0+34+i*24, "sm", C_Text)
+
+    pygame.draw.line(screen, C_Panel_BD, (Width//2-420, Height-60), (Width//2+420, Height-60), 1)
+    txt_center(screen, "Press [ESC] to close report   |   [K] toggles this view", Height-44, "sm", C_Muted)
+
+# ── Legend & startup ─────────────────────────────────────────────────────────
 def draw_map_legend_startup(screen, y_start):
     ex0=Width//2-500; label_col=(220,230,255); title_col=(255,255,255)
     txt(screen,"MAP ELEMENTS",ex0,y_start,"leg",title_col)
